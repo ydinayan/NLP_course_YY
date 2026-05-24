@@ -10,3 +10,6 @@ pii-ner-model-backup/
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
+
+# Claude Code memory
+.claude/
