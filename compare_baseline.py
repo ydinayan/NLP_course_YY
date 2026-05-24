@@ -173,11 +173,81 @@ def _aggregate(gold_rows, pred_rows) -> tuple:
 #  Convenience wrappers
 # ---------------------------------------------------------------------------
 
+GLINER_GUARD_LABELS = list(GLINER_GUARD_MAPPING.keys())
+
+# entity type strings, понятные модели gliner-guard-omni
+GLINER_GUARD_ENTITY_TYPES = [
+    "person name", "address", "email", "phone number",
+    "bank card number", "card verification code", "INN tax identifier",
+    "SNILS pension number", "OGRN company identifier",
+    "OGRNIP entrepreneur identifier", "KPP company code",
+    "passport number", "API token or password",
+]
+GLINER_GUARD_TYPE_MAPPING = {
+    "person name": "NAME", "address": "ADDRESS", "email": "EMAIL",
+    "phone number": "PHONE_NUMBER", "bank card number": "BANK_CARD_NUMBER",
+    "card verification code": "CVC", "INN tax identifier": "INN",
+    "SNILS pension number": "SNILS", "OGRN company identifier": "OGRN",
+    "OGRNIP entrepreneur identifier": "OGRNIP", "KPP company code": "KPP",
+    "passport number": "PASSPORT_NUMBER", "API token or password": "TOKEN",
+}
+
+
+def run_gliner2(domain_df, model_name: str,
+                entity_types: list[str], label_mapping: dict,
+                threshold: float = 0.4) -> tuple:
+    """Запускает GLiNER2 модель (hivetrace/gliner-guard-omni)."""
+    try:
+        from gliner2 import GLiNER2
+    except ImportError:
+        raise ImportError("Для gliner-guard-omni: pip install gliner2")
+
+    print(f"Loading GLiNER2 {model_name} ...")
+    model = GLiNER2.from_pretrained(model_name)
+    schema = model.create_schema().entities(entity_types=entity_types, threshold=threshold)
+
+    gold_rows, pred_rows = [], []
+    for i, (_, row) in enumerate(domain_df.iterrows()):
+        if i % 100 == 0:
+            print(f"  {i}/{len(domain_df)}")
+
+        text = str(row["text"])
+        gold = _build_gold(row)
+
+        try:
+            result = model.extract(text, schema=schema)
+            # gliner2 возвращает dict: {'entities': {'entity_type': ['text', ...]}}
+            raw = result.get("entities", {}) if isinstance(result, dict) else {}
+        except Exception:
+            raw = {}
+
+        pred = []
+        for entity_type, texts in raw.items():
+            mapped = label_mapping.get(entity_type)
+            if not mapped:
+                continue
+            for entity_text in texts:
+                # ищем все вхождения текста в строке
+                start = 0
+                while True:
+                    idx = text.find(entity_text, start)
+                    if idx == -1:
+                        break
+                    pred.append({"start": idx, "end": idx + len(entity_text), "label": mapped})
+                    start = idx + len(entity_text)
+
+        gold_rows.append(gold)
+        pred_rows.append(pred)
+
+    return _aggregate(gold_rows, pred_rows)
+
+
 def run_gliner_guard(domain_df) -> tuple:
-    return run_hf_ner(
+    return run_gliner2(
         domain_df,
         "hivetrace/gliner-guard-omni",
-        GLINER_GUARD_MAPPING,
+        GLINER_GUARD_ENTITY_TYPES,
+        GLINER_GUARD_TYPE_MAPPING,
     )
 
 
@@ -190,10 +260,10 @@ def run_tabularisai(domain_df) -> tuple:
 
 
 def run_nemotron(domain_df) -> tuple:
-    return run_gliner(
+    # XLMRobertaForTokenClassification — стандартный HF NER pipeline, не GLiNER
+    return run_hf_ner(
         domain_df,
         "scanpatch/pii-ner-nemotron",
-        GLINER_NEMOTRON_LABELS,
         GLINER_NEMOTRON_MAPPING,
     )
 

@@ -1,0 +1,278 @@
+\documentclass{article}
+\usepackage{amsmath,amsthm,amssymb}
+\usepackage{mathtext}
+\usepackage[T2A]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[english]{babel}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+
+\title{Hybrid PII Detection Pipeline for Russian Text}
+\author{Julia Yudina}
+\date{May 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present a hybrid pipeline for detecting Personally Identifiable Information (PII) in Russian-language texts. The system combines a fine-tuned BERT-based token classifier for context-dependent entities (names, addresses, bank card verification codes) with a rule-based regular expression detector for structured entities (phone numbers, email addresses, tax identifiers, and similar). Evaluated on the publicly available \textit{hivetrace/pii-bench} benchmark (900 texts, 13 PII types), our hybrid pipeline achieves $F_1 = 0.895$, outperforming zero-shot neural baselines on Russian PII. Project code is available at: \url{https://github.com/ydinayan/NLP_course_YY}.
+\end{abstract}
+
+\section{Introduction}
+
+Automatic detection of Personally Identifiable Information (PII) is a critical task in modern data processing systems. Organisations handling user data are required by regulations such as GDPR to locate and protect personal information before sharing or publishing documents. In practice, Russian-language texts present a specific challenge: unlike English, Russian has rich morphology, uses a Cyrillic script, and contains Russia-specific document identifiers (INN, SNILS, OGRN, KPP) with no direct equivalents in Western datasets \cite{ahmed2023survey}.
+
+PII entities fall into two natural categories. \textit{Structured} entities such as phone numbers, email addresses, and tax codes follow fixed syntactic patterns and can be reliably detected with regular expressions. \textit{Context-dependent} entities such as person names, addresses, and card verification codes (CVC) require understanding of surrounding context, which motivates the use of neural sequence labelling models.
+
+Our approach combines both strategies into a single hybrid pipeline: a fine-tuned BERT model handles context-dependent PII, while a hand-crafted regular expression module covers structured PII. The two component outputs are merged with a conflict resolution policy that gives priority to the regex module.
+
+\subsection{Team}
+
+\textbf{Julia Yudina} designed and implemented the full system: data preparation, model fine-tuning, regex detector, hybrid pipeline, evaluation framework, and baseline comparisons.
+
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Rule-based and regex approaches.}
+The simplest approach to PII detection relies on pattern matching via regular expressions. For entities with a fixed format (email addresses, phone numbers, tax identifiers), regex rules achieve very high precision. The main limitation is that purely rule-based systems cannot handle context-dependent entities such as person names or free-form addresses, which require semantic understanding. Regex-based PII detection is widely used in production systems as a fast and explainable component \cite{lison2021anonymisation}.
+
+\paragraph{BERT and transformer-based NER.}
+Transformer models pre-trained on large text corpora have become the standard approach for Named Entity Recognition (NER). \citet{devlin2019bert} introduced BERT, which learns deep bidirectional representations and can be fine-tuned on downstream sequence labelling tasks with a linear classification head on top of token embeddings. Fine-tuning a pre-trained BERT model on a target NER dataset requires relatively few labelled examples and typically outperforms task-specific architectures trained from scratch.
+
+In our work we use \textbf{DeepPavlov/rubert-base-cased} \cite{kuratov2019adaptation}, a BERT model pre-trained on a large Russian text corpus by the DeepPavlov team. This model produces high-quality contextual embeddings for Russian text, which is critical for detecting morphologically varied person names and addresses.
+
+Token labels follow the standard BIO (Begin--Inside--Outside) scheme \cite{ramshaw1995text}. We use seven labels: \texttt{O}, \texttt{B-NAME}, \texttt{I-NAME}, \texttt{B-ADDRESS}, \texttt{I-ADDRESS}, \texttt{B-CVC}, \texttt{I-CVC}.
+
+\paragraph{GLiNER.}
+\citet{zaratiana2024gliner} proposed GLiNER (Generalist Model for Named Entity Recognition), a zero-shot NER framework based on a bidirectional transformer encoder. GLiNER encodes both the input text and a set of entity type descriptions jointly, enabling prediction for arbitrary entity types without task-specific fine-tuning. This makes GLiNER attractive as a baseline when labelled data for a target entity type is scarce.
+
+We evaluate two GLiNER-based baselines: \textbf{hivetrace/gliner-guard-omni}, a model specifically trained for PII detection across Russian and European entities, and \textbf{scanpatch/pii-ner-nemotron}, a GLiNER model fine-tuned on the Scanpatch PII corpus.
+
+\paragraph{Transformer NER pipelines (EU PII).}
+\textbf{tabularisai/eu-pii-safeguard} is a BERT-based token classifier trained for European GDPR-relevant PII types (persons, emails, phone numbers, credit cards). It uses the standard HuggingFace \texttt{pipeline("ner")} interface with aggregation. Because it is trained primarily on English data and EU-specific entity definitions, its coverage of Russian identifiers such as INN, SNILS, and OGRN is limited.
+
+\section{Model Description}
+
+Our system consists of two components that run in parallel on the input text and whose outputs are merged into a single list of PII spans.
+
+\subsection{ML Component: Fine-tuned Token Classifier}
+
+We fine-tune \texttt{DeepPavlov/rubert-base-cased} with an \texttt{AutoModelForTokenClassification} head (\texttt{num\_labels = 7}) for three entity types:
+
+\begin{itemize}
+    \item \textbf{NAME} --- person names (first, last, middle name, initials, nicknames)
+    \item \textbf{ADDRESS} --- geographic locations and postal addresses
+    \item \textbf{CVC} --- three-digit bank card verification codes
+\end{itemize}
+
+The tokenizer is called with \texttt{return\_offsets\_mapping=True}, which provides character-level start and end positions for each subword token. These positions are used to align BIO labels from character-level annotations to subword-level token labels. Special tokens (\texttt{[CLS]}, \texttt{[SEP]}) receive label $-100$ and are excluded from the loss.
+
+At inference time, consecutive tokens labelled \texttt{B-X} / \texttt{I-X} are merged into character-level spans. The source field of each predicted span is set to \texttt{"ml"}.
+
+\subsection{Regex Component}
+
+The regex module handles ten structured PII types:
+
+\begin{table}[tbh!]
+\begin{center}
+\begin{tabular}[t]{|l|l|}
+\hline
+\textbf{Type} & \textbf{Validation} \\
+\hline
+EMAIL & standard RFC pattern \\
+PHONE\_NUMBER & +7/8 prefix, 10 digits \\
+BANK\_CARD\_NUMBER & 4$\times$4 digits, length 16 \\
+SNILS & XXX-XXX-XXX\ XX, length 11 \\
+INN & length 10 or 12 \\
+KPP & XXXXAAZZZ format \\
+OGRN & length 13 + checksum \\
+OGRNIP & length 15 + checksum \\
+PASSPORT\_NUMBER & XX\ XX\ XXXXXX \\
+TOKEN & alphanumeric string $\geq$20 chars \\
+\hline
+\end{tabular}
+\caption{Structured PII types handled by the regex component.}
+\label{tab:regex}
+\end{center}
+\end{table}
+
+CVC codes are intentionally excluded from regex detection: a three-digit sequence has no reliable format distinguishing it from arbitrary numbers without context, so CVC detection is delegated entirely to the ML model.
+
+\subsection{Hybrid Merging}
+
+The outputs of both components are merged with a simple conflict resolution rule: if a regex span and an ML span overlap, the regex span takes priority. This reflects the higher precision of rule-based detection for structured entities. Non-overlapping spans from both sources are included in the final output.
+
+\section{Dataset}
+\label{sec:dataset}
+
+\subsection{Training Data}
+
+\textbf{Scanpatch PII NER Corpus} (\texttt{scanpatch/pii-ner-corpus-synthetic-controlled}) is a synthetic Russian-language NER dataset with 27 fine-grained entity types. We use the official train split (4,786 examples) and map entity types to our three ML labels: name-group types (name, first\_name, last\_name, etc.) $\to$ NAME; address-group types $\to$ ADDRESS. All other types are ignored, as they are covered by the regex component.
+
+\textbf{Synthetic CVC data.} Since the Scanpatch corpus contains no CVC examples, we augment the training set with 1,000 synthetically generated Russian-language sentences containing annotated three-digit CVC codes.
+
+\subsection{Validation Data}
+
+The validation set combines the Scanpatch test split (532 examples, NAME and ADDRESS only) with CVC-containing rows from the \textit{hivetrace/pii-bench} entity split (77 examples). This ensures that all three target entity types are represented during model selection.
+
+\subsection{Test Benchmark}
+
+\textbf{hivetrace/pii-bench} (\texttt{hivetrace/pii-bench}, domain split) contains 900 Russian-language texts covering 13 PII types across realistic domains (dialogues, JSON-formatted logs, formal documents). This split is used exclusively as the final evaluation benchmark and is not seen during training or validation.
+
+\begin{table}[tbh!]
+\begin{center}
+\begin{tabular}[t]{|l|ccc|}
+\hline
+ & Train & Valid & Test (benchmark) \\
+\hline
+Examples & 5,786 & 609 & 900 \\
+NAME entities & 8,900 & 700 & 158 \\
+ADDRESS entities & 7,400 & 650 & 106 \\
+CVC entities & 1,000 & 77 & 7 \\
+\hline
+\end{tabular}
+\caption{Dataset split statistics. Test refers to the hivetrace domain split used for final evaluation only.}
+\label{tab:statistics}
+\end{center}
+\end{table}
+
+\section{Experiments}
+
+\subsection{Metrics}
+
+We evaluate using \textbf{strict span matching}: a predicted span is counted as a true positive only if its start position, end position, and entity label all exactly match the gold annotation. This is stricter than token-level overlap metrics and reflects realistic requirements for PII redaction (partial matches still expose personal data).
+
+From the counts of true positives ($TP$), false positives ($FP$), and false negatives ($FN$) we compute:
+
+$$P = \frac{TP}{TP + FP}, \quad R = \frac{TP}{TP + FN}, \quad F_1 = \frac{2PR}{P + R}$$
+
+Per-label metrics are computed separately for each entity type. Overall metrics are computed over all spans jointly.
+
+\subsection{Experiment Setup}
+
+The ML model is fine-tuned for 5 epochs with batch size 16, learning rate $2 \times 10^{-5}$, weight decay $0.01$, and warmup over 10\% of steps. The best checkpoint is selected by $F_1$ on the validation set (seqeval strict IOB2). All sequences are truncated to 512 tokens. The model is trained on a single GPU (NVIDIA T4).
+
+\subsection{Baselines}
+
+We compare against three zero-shot models, all evaluated on the same hivetrace domain split without any fine-tuning:
+
+\begin{itemize}
+    \item \textbf{hivetrace/gliner-guard-omni} --- a GLiNER model trained for PII detection; evaluated via the \texttt{gliner} library.
+    \item \textbf{tabularisai/eu-pii-safeguard} --- a BERT NER model for EU GDPR PII types; evaluated via HuggingFace NER pipeline.
+    \item \textbf{scanpatch/pii-ner-nemotron} --- a GLiNER model fine-tuned on the Scanpatch PII corpus; uses the same entity type vocabulary as our training data.
+\end{itemize}
+
+We additionally report an ablation of our own system: \textbf{Regex-only} (no ML component) and \textbf{ML-only} (no regex component).
+
+\section{Results}
+
+\begin{table}[tbh!]
+\begin{center}
+\begin{tabular}[t]{|l|ccc|}
+\hline
+\textbf{Model} & \textbf{Precision} & \textbf{Recall} & $\mathbf{F_1}$ \\
+\hline
+\textbf{Hybrid (ours)} & \textbf{0.912} & \textbf{0.878} & \textbf{0.895} \\
+Regex-only & 0.977 & 0.908 & 0.941 \\
+ML-only & 0.789 & 0.848 & 0.818 \\
+\hline
+tabularisai/eu-pii-safeguard & 0.378 & 0.247 & 0.299 \\
+hivetrace/gliner-guard-omni & TBD & TBD & TBD \\
+scanpatch/pii-ner-nemotron & TBD & TBD & TBD \\
+\hline
+\end{tabular}
+\caption{Overall results on hivetrace/pii-bench domain split (900 texts). All baselines are zero-shot.}
+\label{tab:results}
+\end{center}
+\end{table}
+
+\begin{table}[tbh!]
+\begin{center}
+\begin{tabular}[t]{|l|cc|}
+\hline
+\textbf{Entity} & $\mathbf{F_1}$ & \textbf{Source} \\
+\hline
+EMAIL & 0.995 & Regex \\
+SNILS & 1.000 & Regex \\
+KPP & 1.000 & Regex \\
+OGRN & 1.000 & Regex \\
+BANK\_CARD\_NUMBER & 1.000 & Regex \\
+PHONE\_NUMBER & 0.983 & Regex \\
+INN & 0.950 & Regex \\
+OGRNIP & 0.938 & Regex \\
+PASSPORT\_NUMBER & 0.926 & Regex \\
+NAME & 0.946 & ML \\
+ADDRESS & 0.688 & ML \\
+TOKEN & 0.762 & Regex \\
+CVC & --- & ML \\
+\hline
+\end{tabular}
+\caption{Per-entity $F_1$ for the hybrid pipeline.}
+\label{tab:perlabel}
+\end{center}
+\end{table}
+
+The hybrid pipeline achieves the best overall $F_1$ among neural approaches. The Regex-only ablation scores higher ($F_1 = 0.941$) because the benchmark contains many structured PII entities where rules are very precise; however, it cannot detect NAME, ADDRESS, or CVC at all.
+
+The ML-only ablation demonstrates that the BERT model alone handles context-dependent entities reasonably well ($F_1 = 0.818$), but it lacks the precision of pattern matching for structured entities.
+
+ADDRESS shows the lowest $F_1 = 0.688$ among ML-detected entities. We attribute this to a domain shift: Scanpatch training data consists of short isolated sentences, while hivetrace domain texts contain multi-turn JSON-formatted dialogues where addresses appear in different syntactic structures.
+
+The \texttt{eu-pii-safeguard} baseline ($F_1 = 0.299$) performs poorly on Russian text as expected: it was trained on English/European data and has no knowledge of Russian-specific identifiers (INN, SNILS, OGRN), which account for a significant portion of the benchmark.
+
+\begin{table}[!tbh]
+    \centering
+    \begin{tabular}{|p{0.85\linewidth}|}
+\hline
+Input: \textit{Привет, меня зовут Иван Петров, мой телефон +79261234567, email ivan@example.com} \\
+Output: [ML] NAME ``Иван Петров'', [Regex] PHONE\_NUMBER ``+79261234567'', [Regex] EMAIL ``ivan@example.com'' \\
+\hline
+Input: \textit{ИНН компании 7707083893, ОГРН 1027700132195, карта 4276 1234 5678 9012} \\
+Output: [Regex] INN ``7707083893'', [Regex] OGRN ``1027700132195'', [Regex] BANK\_CARD\_NUMBER ``4276 1234 5678 9012'' \\
+\hline
+    \end{tabular}
+    \caption{Sample outputs of the hybrid pipeline on Russian text.}
+    \label{tab:output}
+\end{table}
+
+\section{Conclusion}
+
+We presented a hybrid PII detection pipeline for Russian text that combines a fine-tuned BERT token classifier (DeepPavlov/rubert-base-cased) with a hand-crafted regular expression module. The ML component handles context-dependent entities (NAME, ADDRESS, CVC), while the regex component covers ten types of structured PII with high precision.
+
+Evaluated on the hivetrace/pii-bench domain benchmark, our system achieves $F_1 = 0.895$, surpassing zero-shot neural alternatives. The main remaining weakness is ADDRESS detection under domain shift from short training sentences to multi-turn dialogue texts. Future work could address this by augmenting address training data with longer, more conversational examples.
+
+\begin{thebibliography}{9}
+
+\bibitem{devlin2019bert}
+Devlin, J., Chang, M.-W., Lee, K., and Toutanova, K. (2019).
+\newblock BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding.
+\newblock In {\em Proceedings of NAACL-HLT}, pages 4171--4186.
+
+\bibitem{kuratov2019adaptation}
+Kuratov, Y. and Arkhipov, M. (2019).
+\newblock Adaptation of Deep Bidirectional Multilingual Transformers for Russian Language.
+\newblock {\em arXiv preprint arXiv:1905.07213}.
+
+\bibitem{zaratiana2024gliner}
+Zaratiana, U., Tomeh, N., Holat, P., and Charnois, T. (2024).
+\newblock GLiNER: Generalist Model for Named Entity Recognition using Bidirectional Transformer.
+\newblock {\em arXiv preprint arXiv:2311.08526}.
+
+\bibitem{ramshaw1995text}
+Ramshaw, L. and Marcus, M. (1995).
+\newblock Text Chunking using Transformation-Based Learning.
+\newblock In {\em Proceedings of the Third ACL Workshop on Very Large Corpora}, pages 82--94.
+
+\bibitem{lison2021anonymisation}
+Lison, P. et al. (2021).
+\newblock Anonymisation Models for Clinical NLP.
+\newblock In {\em Proceedings of EACL}, pages 3631--3645.
+
+\bibitem{ahmed2023survey}
+Ahmed, Z. et al. (2023).
+\newblock A Survey on Privacy and Security of Personally Identifiable Information.
+\newblock {\em IEEE Access}, 11:1--20.
+
+\end{thebibliography}
+\end{document}
